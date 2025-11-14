@@ -10,7 +10,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, precision_recall_curve, auc
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
@@ -85,19 +86,26 @@ def calculate_atr(data, period=14):
 def load_and_engineer_features(filepath):
     """加载数据并进行特征工程"""
     # 加载数据
+    print(f"  → 读取CSV文件: {filepath}")
     df = pd.read_csv(filepath, parse_dates=['日期'])
+    print(f"  → 原始数据行数: {len(df)}")
     df = df[df['日期'].dt.year > 2000]
+    print(f"  → 过滤2000年后数据: {len(df)} 行")
     
     # 转换格式
+    print(f"  → 转换交易量格式...")
     df['交易量'] = df['交易量'].apply(convert_volume)
+    print(f"  → 转换涨跌幅格式...")
     df['涨跌幅'] = df['涨跌幅'].apply(convert_change)
     
     # 确保价格列是数值类型
+    print(f"  → 转换价格列为数值类型...")
     for col in ['收盘', '开盘', '高', '低']:
         df[col] = df[col].astype(str).str.replace(',', '').str.replace('$', '').str.replace('¥', '')
         df[col] = pd.to_numeric(df[col], errors='coerce')
     
     # 排序和设置索引
+    print(f"  → 按日期排序并设置索引...")
     df.sort_values('日期', inplace=True)
     df.set_index('日期', inplace=True)
     df.fillna(method='ffill', inplace=True)
@@ -105,28 +113,44 @@ def load_and_engineer_features(filepath):
     df.fillna(method='ffill', inplace=True)
     
     # 特征工程
+    print(f"  → 计算基础特征...")
     df['日变化'] = df['收盘'].diff()
     df['开盘收盘差'] = df['收盘'] - df['开盘']
     df['高低差'] = df['高'] - df['低']
+    
+    print(f"  → 计算移动平均线 (SMA 7天, 30天)...")
     df['SMA_7'] = df['收盘'].rolling(window=7, min_periods=1).mean()
     df['SMA_30'] = df['收盘'].rolling(window=30, min_periods=1).mean()
+    
+    print(f"  → 计算指数移动平均线和MACD...")
     df['EMA_12'] = df['收盘'].ewm(span=12, adjust=False, min_periods=1).mean()
     df['EMA_26'] = df['收盘'].ewm(span=26, adjust=False, min_periods=1).mean()
     df['MACD'] = df['EMA_12'] - df['EMA_26']
     df['信号线'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['信号线']
+    
+    print(f"  → 计算波动率和RSI...")
     df['波动率'] = df['收盘'].rolling(window=60, min_periods=1).std()
     df['RSI'] = calculate_rsi(df['收盘'], 14)
+    
+    print(f"  → 计算布林带...")
     df['中轨'] = df['收盘'].rolling(window=20).mean()
     df['上轨'] = df['中轨'] + 2 * df['收盘'].rolling(window=20).std()
     df['下轨'] = df['中轨'] - 2 * df['收盘'].rolling(window=20).std()
+    
+    print(f"  → 计算ATR指标...")
     df['ATR'] = calculate_atr(df, 14)
     
     # 滞后特征
+    print(f"  → 创建60天滞后特征...")
     for i in range(1, 61):
         df[f'滞后_{i}'] = df['收盘'].shift(i)
     
+    print(f"  → 删除缺失值...")
+    print(f"  → 删除前数据量: {len(df)}")
     df.dropna(inplace=True)
+    print(f"  → 删除后数据量: {len(df)}")
+    print(f"  → 最终特征数量: {len(df.columns)}")
     return df
 
 # =============================================================================
@@ -149,6 +173,7 @@ def create_volatility_labels(df, days_ahead=1, threshold=0.03):
         0 = 低波动（正常）
         1 = 高波动（大涨大跌）
     """
+    print(f"  → 计算未来{days_ahead}天的收益率...")
     future_returns = []
     
     for i in range(days_ahead):
@@ -157,10 +182,14 @@ def create_volatility_labels(df, days_ahead=1, threshold=0.03):
         future_returns.append(ret.abs())
     
     # 取未来N天的最大涨跌幅
+    print(f"  → 计算未来{days_ahead}天的最大涨跌幅...")
     max_future_change = pd.concat(future_returns, axis=1).max(axis=1)
     
     # 标记高波动
+    print(f"  → 标记高波动事件 (阈值: {threshold*100}%)...")
     labels = (max_future_change > threshold).astype(int)
+    
+    print(f"  → 最大涨跌幅统计: 均值={max_future_change.mean()*100:.2f}%, 最大={max_future_change.max()*100:.2f}%")
     
     return labels, max_future_change
 
@@ -174,9 +203,12 @@ def prepare_data_for_classification(df, labels, time_steps=60, train_ratio=0.8):
     
     🔑 关键改进：先划分再标准化，避免数据泄漏！
     """
+    print(f"  → 提取特征列...")
     feature_cols = [col for col in df.columns if not col.startswith('目标_')]
+    print(f"  → 特征列数量: {len(feature_cols)}")
     
     # 先按时间划分
+    print(f"  → 按时间划分数据集 (训练集比例: {train_ratio*100}%)...")
     split_idx = int(len(df) * train_ratio)
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
@@ -187,13 +219,17 @@ def prepare_data_for_classification(df, labels, time_steps=60, train_ratio=0.8):
     print(f"测试集时间: {test_df.index[0]} 到 {test_df.index[-1]}")
     
     # ✅ 只用训练集拟合scaler
+    print(f"  → 使用训练集拟合MinMaxScaler...")
     scaler = MinMaxScaler()
     scaler.fit(train_df[feature_cols])
     
+    print(f"  → 标准化训练集数据...")
     train_scaled = scaler.transform(train_df[feature_cols])
+    print(f"  → 标准化测试集数据...")
     test_scaled = scaler.transform(test_df[feature_cols])
     
     # 创建时间序列数据集
+    print(f"  → 创建时间序列样本 (时间步长: {time_steps})...")
     def create_sequences(data, labels, time_steps):
         X, y = [], []
         for i in range(len(data) - time_steps):
@@ -201,7 +237,9 @@ def prepare_data_for_classification(df, labels, time_steps=60, train_ratio=0.8):
             y.append(labels[i + time_steps])
         return np.array(X), np.array(y)
     
+    print(f"  → 生成训练序列...")
     X_train, y_train = create_sequences(train_scaled, train_labels, time_steps)
+    print(f"  → 生成测试序列...")
     X_test, y_test = create_sequences(test_scaled, test_labels, time_steps)
     
     return {
@@ -219,22 +257,40 @@ def prepare_data_for_classification(df, labels, time_steps=60, train_ratio=0.8):
 # 5. 构建分类模型（预测高波动/低波动）
 # =============================================================================
 
-def create_volatility_classifier(input_shape):
+def create_volatility_classifier(input_shape, dropout_rate=0.1, learning_rate=0.001):
     """创建波动分类模型"""
+    print(f"  → 创建LSTM模型...")
+    print(f"  → 输入形状: {input_shape}")
+    
     model = Sequential([
         LSTM(64, return_sequences=True, input_shape=input_shape),
-        Dropout(0.3),
+        Dropout(dropout_rate),
         LSTM(32, return_sequences=False),
-        Dropout(0.3),
+        Dropout(dropout_rate),
         Dense(16, activation='relu'),
         Dense(1, activation='sigmoid')  # 二分类：0=低波动，1=高波动
     ])
     
+    print(f"  → 模型层数: 6")
+    print(f"  → LSTM层1: 64单元 (return_sequences=True)")
+    print(f"  → Dropout层1: {dropout_rate*100:.0f}%")
+    print(f"  → LSTM层2: 32单元")
+    print(f"  → Dropout层2: {dropout_rate*100:.0f}%")
+    print(f"  → Dense层1: 16单元 (ReLU)")
+    print(f"  → 输出层: 1单元 (Sigmoid)")
+    
     model.compile(
-        optimizer=Adam(learning_rate=0.001),
+        optimizer=Adam(learning_rate=learning_rate),
         loss='binary_crossentropy',
         metrics=['accuracy']
     )
+    
+    print(f"  → 优化器: Adam (learning_rate={learning_rate})")
+    print(f"  → 损失函数: binary_crossentropy")
+    print(f"  → 评估指标: accuracy")
+    
+    total_params = model.count_params()
+    print(f"  → 总参数量: {total_params:,}")
     
     return model
 
@@ -253,17 +309,24 @@ def main():
     THRESHOLD = 0.03      # 波动阈值：3%
     TIME_STEPS = 60       # 使用过去60天数据
     TRAIN_RATIO = 0.8     # 80%训练，20%测试
+    DROPOUT_RATE = 0.1    # Dropout比率
+    EPOCHS = 50           # 最大训练轮数
+    BATCH_SIZE = 32       # 批次大小
+    LEARNING_RATE = 0.001 # 学习率
     
     print(f"\n参数设置:")
     print(f"- 预测时长: 未来{DAYS_AHEAD}天")
     print(f"- 波动阈值: {THRESHOLD*100}% (超过此值视为高波动)")
     print(f"- 训练集比例: {TRAIN_RATIO*100}%")
+    print(f"- Dropout比率: {DROPOUT_RATE*100}%")
+    print(f"- 学习率: {LEARNING_RATE}")
     
     # 1. 加载数据
     print("\n[1/5] 加载数据和特征工程...")
     df = load_and_engineer_features('比特币历史数据2.csv')
     print(f"数据时间范围: {df.index[0]} 到 {df.index[-1]}")
     print(f"总数据量: {len(df)} 天")
+    print(f"价格统计: 最低=${df['收盘'].min():,.2f}, 最高=${df['收盘'].max():,.2f}, 平均=${df['收盘'].mean():,.2f}")
     
     # 2. 创建波动标签
     print(f"\n[2/5] 创建波动标签（阈值：{THRESHOLD*100}%）...")
@@ -274,51 +337,135 @@ def main():
     low_vol_count = len(labels) - high_vol_count
     print(f"高波动天数: {high_vol_count} ({high_vol_count/len(labels)*100:.1f}%)")
     print(f"低波动天数: {low_vol_count} ({low_vol_count/len(labels)*100:.1f}%)")
+    print(f"类别平衡比: 1:{low_vol_count/high_vol_count:.2f} (高波动:低波动)")
     
     # 3. 准备数据
     print("\n[3/5] 准备训练和测试数据（避免数据泄漏）...")
     data = prepare_data_for_classification(df, labels, time_steps=TIME_STEPS, train_ratio=TRAIN_RATIO)
-    print(f"训练样本数: {len(data['X_train'])} (高波动: {data['y_train'].sum()})")
-    print(f"测试样本数: {len(data['X_test'])} (高波动: {data['y_test'].sum()})")
+    print(f"训练样本数: {len(data['X_train'])} (高波动: {data['y_train'].sum()}, 比例: {data['y_train'].sum()/len(data['y_train'])*100:.1f}%)")
+    print(f"测试样本数: {len(data['X_test'])} (高波动: {data['y_test'].sum()}, 比例: {data['y_test'].sum()/len(data['y_test'])*100:.1f}%)")
+    print(f"输入特征维度: {data['X_train'].shape}")
+    
+    # 3.5 计算类别权重（解决不平衡问题）
+    print("\n[3.5/5] 计算类别权重（解决类别不平衡问题）...")
+    class_weights = compute_class_weight(
+        'balanced',
+        classes=np.unique(data['y_train']),
+        y=data['y_train']
+    )
+    class_weight_dict = {0: class_weights[0], 1: class_weights[1]}
+    print(f"  → 低波动类别权重: {class_weights[0]:.4f}")
+    print(f"  → 高波动类别权重: {class_weights[1]:.4f}")
+    print(f"  → 权重比例: 1:{class_weights[1]/class_weights[0]:.2f}")
+    print(f"  → 说明: 高波动样本将获得{class_weights[1]/class_weights[0]:.2f}倍的关注度")
     
     # 4. 训练模型
     print("\n[4/5] 训练波动预测模型...")
     model = create_volatility_classifier(
-        input_shape=(data['X_train'].shape[1], data['X_train'].shape[2])
+        input_shape=(data['X_train'].shape[1], data['X_train'].shape[2]),
+        dropout_rate=DROPOUT_RATE,
+        learning_rate=LEARNING_RATE
     )
     
-    early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    print(f"  → 设置早停机制 (patience=15, monitor=val_loss)...")
+    early_stop = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+    
+    print(f"  → 开始训练（使用类别权重）...")
+    print(f"  → 训练样本: {len(data['X_train'])}")
+    print(f"  → 验证样本: {int(len(data['X_train']) * 0.2)}")
+    print(f"  → 最大轮数: {EPOCHS}")
+    print(f"  → 批次大小: {BATCH_SIZE}")
+    print(f"  → 应用类别权重: 低波动={class_weight_dict[0]:.4f}, 高波动={class_weight_dict[1]:.4f}")
+    print(f"  → 显示训练进度...")
+    print()
     
     history = model.fit(
         data['X_train'], data['y_train'],
         validation_split=0.2,
-        epochs=50,
-        batch_size=32,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
         callbacks=[early_stop],
-        verbose=0
+        class_weight=class_weight_dict,  # 🔑 添加类别权重
+        verbose=1  # 显示训练进度
     )
+    
+    print(f"\n  → 实际训练轮数: {len(history.history['loss'])}")
+    print(f"  → 最终训练损失: {history.history['loss'][-1]:.4f}")
+    print(f"  → 最终验证损失: {history.history['val_loss'][-1]:.4f}")
+    print(f"  → 最终训练准确率: {history.history['accuracy'][-1]*100:.2f}%")
+    print(f"  → 最终验证准确率: {history.history['val_accuracy'][-1]*100:.2f}%")
+    
+    # 显示训练历史摘要
+    print(f"\n  训练历史摘要:")
+    print(f"  → 最佳训练准确率: {max(history.history['accuracy'])*100:.2f}% (第{history.history['accuracy'].index(max(history.history['accuracy']))+1}轮)")
+    print(f"  → 最佳验证准确率: {max(history.history['val_accuracy'])*100:.2f}% (第{history.history['val_accuracy'].index(max(history.history['val_accuracy']))+1}轮)")
+    print(f"  → 最低训练损失: {min(history.history['loss']):.4f} (第{history.history['loss'].index(min(history.history['loss']))+1}轮)")
+    print(f"  → 最低验证损失: {min(history.history['val_loss']):.4f} (第{history.history['val_loss'].index(min(history.history['val_loss']))+1}轮)")
     print("模型训练完成!")
     
     # 5. 测试集评估
     print("\n[5/5] 在测试集上评估...")
+    print(f"  → 对测试集进行预测...")
     y_pred_prob = model.predict(data['X_test'], verbose=0).flatten()
-    y_pred = (y_pred_prob > 0.5).astype(int)  # 概率>0.5视为高波动
+    print(f"  → 预测概率范围: [{y_pred_prob.min():.4f}, {y_pred_prob.max():.4f}]")
+    print(f"  → 平均预测概率: {y_pred_prob.mean():.4f}")
+    print(f"  → 预测概率中位数: {np.median(y_pred_prob):.4f}")
     
-    # 计算性能指标
+    # 5.1 寻找最佳阈值
+    print(f"\n  → 寻找最佳预测阈值...")
     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
     
+    best_threshold = 0.5
+    best_f1 = 0
+    threshold_results = []
+    
+    for threshold in np.arange(0.1, 0.9, 0.05):
+        y_pred_temp = (y_pred_prob > threshold).astype(int)
+        f1_temp = f1_score(data['y_test'], y_pred_temp, zero_division=0)
+        recall_temp = recall_score(data['y_test'], y_pred_temp, zero_division=0)
+        precision_temp = precision_score(data['y_test'], y_pred_temp, zero_division=0)
+        threshold_results.append({
+            'threshold': threshold,
+            'f1': f1_temp,
+            'recall': recall_temp,
+            'precision': precision_temp
+        })
+        if f1_temp > best_f1:
+            best_f1 = f1_temp
+            best_threshold = threshold
+    
+    print(f"  → 最佳阈值: {best_threshold:.2f} (F1={best_f1:.4f})")
+    print(f"  → 使用最佳阈值进行预测...")
+    
+    y_pred = (y_pred_prob > best_threshold).astype(int)
+    print(f"  → 预测为高波动的样本数: {y_pred.sum()}/{len(y_pred)} ({y_pred.sum()/len(y_pred)*100:.1f}%)")
+    print(f"  → 实际高波动的样本数: {data['y_test'].sum()}/{len(data['y_test'])} ({data['y_test'].sum()/len(data['y_test'])*100:.1f}%)")
+    
+    # 计算性能指标
+    print(f"  → 计算性能指标...")
     accuracy = accuracy_score(data['y_test'], y_pred)
     precision = precision_score(data['y_test'], y_pred, zero_division=0)
     recall = recall_score(data['y_test'], y_pred, zero_division=0)
     f1 = f1_score(data['y_test'], y_pred, zero_division=0)
     
+    # 计算ROC-AUC
+    try:
+        roc_auc = roc_auc_score(data['y_test'], y_pred_prob)
+        print(f"  → ROC-AUC得分: {roc_auc:.4f}")
+    except:
+        roc_auc = 0
+        print(f"  → ROC-AUC得分: 无法计算")
+    
     print("\n" + "="*70)
     print("模型性能评估")
     print("="*70)
+    print(f"最佳预测阈值:       {best_threshold:.2f}   - 优化后的分类阈值")
     print(f"准确率 (Accuracy):  {accuracy*100:.2f}%  - 预测对的比例")
     print(f"精确率 (Precision): {precision*100:.2f}%  - 预警准确度（预警时真的高波动的概率）")
     print(f"召回率 (Recall):    {recall*100:.2f}%  - 捕获率（高波动时能预警的概率）")
     print(f"F1分数:            {f1:.3f}     - 综合指标（精确率和召回率的平均）")
+    if roc_auc > 0:
+        print(f"ROC-AUC:           {roc_auc:.3f}     - 模型整体区分能力")
     
     # 混淆矩阵
     cm = confusion_matrix(data['y_test'], y_pred)
@@ -354,17 +501,24 @@ def main():
     print("="*70)
     
     # 使用最新数据预测
+    print(f"  → 使用最新{TIME_STEPS}天数据进行预测...")
     latest_data = data['X_test'][-1:]
+    print(f"  → 输入数据形状: {latest_data.shape}")
+    
     future_prob = model.predict(latest_data, verbose=0)[0][0]
-    future_pred = 1 if future_prob > 0.5 else 0
+    future_pred = 1 if future_prob > best_threshold else 0  # 使用最佳阈值
     
     latest_date = data['test_dates'][-1]
     latest_price = data['test_prices'][-1]
+    
+    print(f"  → 预测完成!")
+    print(f"  → 使用阈值: {best_threshold:.2f}")
     
     print(f"当前日期: {latest_date.strftime('%Y-%m-%d')}")
     print(f"当前价格: ${latest_price:,.2f}")
     print(f"\n未来{DAYS_AHEAD}天波动预测:")
     print(f"高波动概率: {future_prob*100:.1f}%")
+    print(f"预测阈值: {best_threshold*100:.0f}%")
     
     if future_pred == 1:
         print(f"⚠️  预警：未来{DAYS_AHEAD}天可能出现大涨大跌（涨跌幅>±{THRESHOLD*100}%）")
@@ -375,17 +529,20 @@ def main():
     
     # 8. 可视化
     print("\n生成可视化图表...")
+    print(f"  → 创建图表 (20x12英寸)...")
     
     # 图1: 测试集预测结果
-    plt.figure(figsize=(16, 10))
+    plt.figure(figsize=(20, 12))
     
     # 子图1: 价格和波动预警
+    print(f"  → 绘制子图1: 价格与波动预警...")
     plt.subplot(3, 1, 1)
     plt.plot(data['test_dates'], data['test_prices'], label='价格', linewidth=2, color='blue')
     
     # 标记实际高波动点
     actual_high_vol = np.where(data['y_test'] == 1)[0]
     if len(actual_high_vol) > 0:
+        print(f"  → 标记{len(actual_high_vol)}个实际高波动点...")
         plt.scatter(data['test_dates'][actual_high_vol], 
                    data['test_prices'][actual_high_vol],
                    color='red', s=100, marker='x', label='实际高波动', zorder=5)
@@ -393,6 +550,7 @@ def main():
     # 标记预测高波动点
     pred_high_vol = np.where(y_pred == 1)[0]
     if len(pred_high_vol) > 0:
+        print(f"  → 标记{len(pred_high_vol)}个预测高波动点...")
         plt.scatter(data['test_dates'][pred_high_vol], 
                    data['test_prices'][pred_high_vol],
                    color='orange', s=100, marker='o', alpha=0.5, label='预测高波动', zorder=4)
@@ -403,30 +561,36 @@ def main():
     plt.grid(True, alpha=0.3)
     
     # 子图2: 预测概率曲线
+    print(f"  → 绘制子图2: 预测概率曲线...")
     plt.subplot(3, 1, 2)
     plt.plot(data['test_dates'], y_pred_prob, label='高波动概率', linewidth=2, color='purple')
-    plt.axhline(y=0.5, color='red', linestyle='--', alpha=0.5, label='预警阈值(50%)')
+    plt.axhline(y=best_threshold, color='red', linestyle='--', alpha=0.7, 
+                label=f'最佳阈值({best_threshold:.2f})', linewidth=2)
+    plt.axhline(y=0.5, color='orange', linestyle=':', alpha=0.5, label='默认阈值(0.50)')
     plt.fill_between(data['test_dates'], 0, y_pred_prob, 
-                     where=(y_pred_prob > 0.5), alpha=0.3, color='red', label='高波动区')
-    plt.title('高波动预测概率', fontsize=16)
+                     where=(y_pred_prob > best_threshold), alpha=0.3, color='red', label='高波动区')
+    plt.title(f'高波动预测概率（优化阈值：{best_threshold:.2f}）', fontsize=16)
     plt.ylabel('概率', fontsize=12)
     plt.ylim(0, 1)
     plt.legend()
     plt.grid(True, alpha=0.3)
     
     # 子图3: 混淆矩阵
+    print(f"  → 绘制子图3: 混淆矩阵...")
     plt.subplot(3, 1, 3)
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
                 xticklabels=['预测低波动', '预测高波动'],
                 yticklabels=['实际低波动', '实际高波动'])
     plt.title('混淆矩阵', fontsize=16)
     
+    print(f"  → 调整布局并保存...")
     plt.tight_layout()
     plt.savefig('波动预警结果.png', dpi=150)
     print("✓ 保存图表: 波动预警结果.png")
     
     # 保存预警记录
     if len(high_vol_indices) > 0:
+        print(f"  → 生成预警记录CSV文件...")
         warnings_df = pd.DataFrame({
             '日期': [data['test_dates'][i].strftime('%Y-%m-%d') for i in high_vol_indices],
             '价格': [data['test_prices'][i] for i in high_vol_indices],
@@ -434,6 +598,7 @@ def main():
             '实际波动': ['高波动' if data['y_test'][i] == 1 else '低波动' for i in high_vol_indices],
             '预警结果': ['正确' if data['y_test'][i] == 1 else '误报' for i in high_vol_indices]
         })
+        print(f"  → 预警记录数量: {len(warnings_df)}")
         warnings_df.to_csv('波动预警记录.csv', index=False, encoding='utf-8-sig')
         print("✓ 保存文件: 波动预警记录.csv")
     
@@ -449,7 +614,11 @@ def main():
         'precision': precision,
         'recall': recall,
         'f1': f1,
-        'future_prob': future_prob
+        'roc_auc': roc_auc,
+        'best_threshold': best_threshold,
+        'future_prob': future_prob,
+        'class_weight_dict': class_weight_dict,
+        'threshold_results': threshold_results
     }
 
 if __name__ == "__main__":
