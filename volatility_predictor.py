@@ -257,35 +257,60 @@ def prepare_data_for_classification(df, labels, time_steps=60, train_ratio=0.8):
 # 5. 构建分类模型（预测高波动/低波动）
 # =============================================================================
 
-def create_volatility_classifier(input_shape, dropout_rate=0.1, learning_rate=0.001):
-    """创建波动分类模型"""
-    print(f"  → 创建LSTM模型...")
+def create_volatility_classifier(input_shape, dropout_rate=0.2, learning_rate=0.0005):
+    """创建波动分类模型 - 优化版"""
+    from tensorflow.keras.layers import BatchNormalization
+    
+    print(f"  → 创建优化型LSTM+MLP模型...")
     print(f"  → 输入形状: {input_shape}")
     
     model = Sequential([
-        LSTM(64, return_sequences=True, input_shape=input_shape),
+        # 第一层LSTM - 128单元
+        LSTM(128, return_sequences=True, input_shape=input_shape, recurrent_dropout=0.1),
+        BatchNormalization(),
         Dropout(dropout_rate),
-        LSTM(32, return_sequences=False),
+        
+        # 第二层LSTM - 64单元
+        LSTM(64, return_sequences=False, recurrent_dropout=0.1),
+        BatchNormalization(),
         Dropout(dropout_rate),
-        Dense(16, activation='relu'),
-        Dense(1, activation='sigmoid')  # 二分类：0=低波动，1=高波动
+        
+        # MLP部分
+        Dense(128, activation='relu'),
+        BatchNormalization(),
+        Dropout(dropout_rate),
+        
+        Dense(64, activation='relu'),
+        BatchNormalization(),
+        Dropout(dropout_rate),
+        
+        Dense(32, activation='relu'),
+        Dropout(dropout_rate),
+        
+        # 输出层
+        Dense(1, activation='sigmoid')
     ])
     
-    print(f"  → 模型层数: 6")
-    print(f"  → LSTM层1: 64单元 (return_sequences=True)")
-    print(f"  → Dropout层1: {dropout_rate*100:.0f}%")
-    print(f"  → LSTM层2: 32单元")
-    print(f"  → Dropout层2: {dropout_rate*100:.0f}%")
-    print(f"  → Dense层1: 16单元 (ReLU)")
-    print(f"  → 输出层: 1单元 (Sigmoid)")
+    print(f"  → 模型结构 (添加BatchNormalization稳定训练):")
+    print(f"     ├─ LSTM层1: 128单元 (recurrent_dropout=0.1)")
+    print(f"     ├─ BatchNorm + Dropout: {dropout_rate*100:.0f}%")
+    print(f"     ├─ LSTM层2: 64单元 (recurrent_dropout=0.1)")
+    print(f"     ├─ BatchNorm + Dropout: {dropout_rate*100:.0f}%")
+    print(f"     ├─ Dense层1: 128单元 (ReLU)")
+    print(f"     ├─ BatchNorm + Dropout: {dropout_rate*100:.0f}%")
+    print(f"     ├─ Dense层2: 64单元 (ReLU)")
+    print(f"     ├─ BatchNorm + Dropout: {dropout_rate*100:.0f}%")
+    print(f"     ├─ Dense层3: 32单元 (ReLU)")
+    print(f"     ├─ Dropout: {dropout_rate*100:.0f}%")
+    print(f"     └─ 输出层: 1单元 (Sigmoid)")
     
     model.compile(
-        optimizer=Adam(learning_rate=learning_rate),
+        optimizer=Adam(learning_rate=learning_rate, clipnorm=1.0),  # 添加梯度裁剪
         loss='binary_crossentropy',
         metrics=['accuracy']
     )
     
-    print(f"  → 优化器: Adam (learning_rate={learning_rate})")
+    print(f"  → 优化器: Adam (learning_rate={learning_rate}, clipnorm=1.0)")
     print(f"  → 损失函数: binary_crossentropy")
     print(f"  → 评估指标: accuracy")
     
@@ -309,10 +334,11 @@ def main():
     THRESHOLD = 0.03      # 波动阈值：3%
     TIME_STEPS = 60       # 使用过去60天数据
     TRAIN_RATIO = 0.8     # 80%训练，20%测试
-    DROPOUT_RATE = 0.1    # Dropout比率
-    EPOCHS = 50           # 最大训练轮数
-    BATCH_SIZE = 32       # 批次大小
-    LEARNING_RATE = 0.001 # 学习率
+    DROPOUT_RATE = 0.2    # Dropout比率（先用0.2，太低可能导致不稳定）
+    EPOCHS = 100          # 最大训练轮数
+    BATCH_SIZE = 16       # 批次大小（减小，让梯度更新更频繁）
+    LEARNING_RATE = 0.0005 # 学习率（降低，更稳定）
+    USE_CLASS_WEIGHT = False  # 暂时关闭类别权重，看是否影响训练
     
     print(f"\n参数设置:")
     print(f"- 预测时长: 未来{DAYS_AHEAD}天")
@@ -320,6 +346,8 @@ def main():
     print(f"- 训练集比例: {TRAIN_RATIO*100}%")
     print(f"- Dropout比率: {DROPOUT_RATE*100}%")
     print(f"- 学习率: {LEARNING_RATE}")
+    print(f"- 批次大小: {BATCH_SIZE}")
+    print(f"- 类别权重: {'启用' if USE_CLASS_WEIGHT else '禁用'}")
     
     # 1. 加载数据
     print("\n[1/5] 加载数据和特征工程...")
@@ -367,15 +395,20 @@ def main():
         learning_rate=LEARNING_RATE
     )
     
-    print(f"  → 设置早停机制 (patience=15, monitor=val_loss)...")
-    early_stop = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+    print(f"  → 设置早停机制 (patience=20, monitor=val_loss)...")
+    early_stop = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
     
-    print(f"  → 开始训练（使用类别权重）...")
+    if USE_CLASS_WEIGHT:
+        print(f"  → 开始训练（使用类别权重）...")
+        print(f"  → 应用类别权重: 低波动={class_weight_dict[0]:.4f}, 高波动={class_weight_dict[1]:.4f}")
+    else:
+        print(f"  → 开始训练（不使用类别权重）...")
+        print(f"  → 注意: 类别权重已禁用，使用均衡采样")
+    
     print(f"  → 训练样本: {len(data['X_train'])}")
     print(f"  → 验证样本: {int(len(data['X_train']) * 0.2)}")
     print(f"  → 最大轮数: {EPOCHS}")
     print(f"  → 批次大小: {BATCH_SIZE}")
-    print(f"  → 应用类别权重: 低波动={class_weight_dict[0]:.4f}, 高波动={class_weight_dict[1]:.4f}")
     print(f"  → 显示训练进度...")
     print()
     
@@ -385,7 +418,7 @@ def main():
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         callbacks=[early_stop],
-        class_weight=class_weight_dict,  # 🔑 添加类别权重
+        class_weight=class_weight_dict if USE_CLASS_WEIGHT else None,
         verbose=1  # 显示训练进度
     )
     
